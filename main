@@ -1,0 +1,233 @@
+from google.cloud import vision
+import openai
+import os
+from picamera2 import Picamera2
+from time import sleep, time as current_time
+import RPi.GPIO as GPIO
+import pyttsx3
+
+# GPIO setup for the buttons
+BUTTON1_PIN = 16  # Button 1: Capture image and process
+BUTTON2_PIN = 20  # Button 2: Adjust playback speed
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(BUTTON1_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP) 
+GPIO.setup(BUTTON2_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP) 
+
+##  key redacted for personal and security reasons
+openai.api_key = "YOUR_OPENAI_API_KEY"  # Replace with your OpenAI API key
+
+# Initialize Picamera2 and Text-to-Speech
+picam2 = Picamera2()
+tts_engine = pyttsx3.init()
+
+last_spoken_text = ""  # Stores the exact last spoken text
+
+def configure_camera():
+    """Configure the Picamera2 object."""
+    print("Configuring camera...")
+    config = picam2.create_still_configuration()
+    picam2.configure(config)
+
+def start_camera():
+    """Start the camera."""
+    print("Starting camera...")
+    picam2.start()
+
+def stop_camera():
+    """Stop the camera."""
+    print("Stopping camera...")
+    picam2.stop()
+
+def capture_image(image_path):
+    """Capture an image using the Picamera2 object."""
+    try:
+        print("Capturing image...")
+        picam2.capture_file(image_path)
+        print(f"Image captured and saved to {image_path}")
+    except Exception as e:
+        print(f"Error capturing image: {e}")
+
+
+def speak_text(text, speed_multiplier=1.5):
+    """Speak the provided text using TTS with adjustable speed."""
+    tts_engine.setProperty('rate', int(200 * speed_multiplier))  # Default rate is 200
+    print(f"Speaking at {speed_multiplier}x speed: {text}")
+    tts_engine.say(text)
+    tts_engine.runAndWait()
+
+def detect_text(image_path):
+    """Detect and extract text from the image using Google Vision API."""
+    client = vision.ImageAnnotatorClient()
+
+    # Read the image file
+    with open(image_path, "rb") as image_file:
+        content = image_file.read()
+
+    image = vision.Image(content=content)
+
+    # Perform text detection
+    response = client.text_detection(image=image)
+    texts = response.text_annotations
+
+    if texts:
+        # Return the full text from the first element which contains the entire text block
+        full_text = texts[0].description
+        print("Text detected in the image:")
+        print(full_text)
+        return full_text
+    else:
+        return ""
+
+def detect_objects(image_path):
+    """Detect objects and labels in the image using Google Vision API."""
+    client = vision.ImageAnnotatorClient()
+
+    # Read the image file
+    with open(image_path, "rb") as image_file:
+        content = image_file.read()
+
+    # Create an image object
+    image = vision.Image(content=content)
+
+    # Perform label detection
+    response = client.label_detection(image=image)
+    labels = response.label_annotations
+
+    # Collect detected labels
+    detected_labels = [label.description for label in labels]
+    print("Labels detected in the image:")
+    for label in labels:
+        print(f"{label.description}: {label.score:.2f}")
+
+    return detected_labels
+
+def interpret_with_gpt(objects):
+    """Send detected objects to OpenAI GPT for interpretation."""
+    objects_text = ", ".join(objects) if objects else "No objects detected"
+    prompt = (
+        f"The following objects were detected in an image: {objects_text}. "
+        "Please describe the scene in exactly two sentences, providing a meaningful interpretation for someone who is visually impaired."
+    )
+
+    try:
+        # Call the GPT API
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a device that helps visually impaired people understand images by describing objects."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=300,
+        )
+
+        # Extract the GPT response and limit it to two sentences
+        gpt_response = response['choices'][0]['message']['content']
+        sentences = gpt_response.split(". ")  # Split response into sentences
+        two_sentences = ". ".join(sentences[:2]).strip() + "."  # Limit to the first two sentences
+        print("GPT Response (2 sentences):")
+        print(two_sentences)
+        return two_sentences
+
+    except Exception as e:
+        print(f"Error with OpenAI API: {e}")
+        return "An error occurred while interpreting the scene."
+
+def handle_button1():
+    """Handle Button 1 press with timing-based functionality."""
+    global last_spoken_text  # Update the global variable to store the last spoken text
+
+    press_start_time = current_time()
+
+    # Wait until the button is released
+    while GPIO.input(BUTTON1_PIN) == GPIO.LOW:
+        sleep(0.1)
+
+    press_duration = current_time() - press_start_time
+    print(f"Button 1 pressed for {press_duration:.2f} seconds.")
+
+    # Capture an image
+    image_path = "captured_image.jpg"
+    capture_image(image_path)
+
+    # Short press (< 0.5 seconds): Perform text analysis only
+    if press_duration < 0.5:
+        print("Short press detected: Running text analysis only.")
+        detected_text = detect_text(image_path)  # Detect text in the image
+        if detected_text:
+            print("Detected Text:")
+            print(detected_text)
+            last_spoken_text = f"Detected text: {detected_text}"  # Store the spoken text
+            speak_text(last_spoken_text, speed_multiplier=1.5)  # Speak detected text
+        else:
+            print("No text detected.")
+            last_spoken_text = "No text detected."
+            speak_text(last_spoken_text, speed_multiplier=1.5)
+
+    # Long press (≥ 0.5 seconds): Perform full processing
+    else:
+        print("Long press detected: Running full image processing.")
+        detected_labels = detect_objects(image_path)  # Detect objects in the image
+        detected_text = detect_text(image_path)  # Detect text in the image
+        scene_description = interpret_with_gpt(detected_labels)  # Interpret scene with GPT
+
+        
+        text_message = f"Detected text: {detected_text}" if detected_text else "No text detected."
+        scene_message = f"The scene is described as follows: {scene_description}" if scene_description else "Scene description unavailable."
+        full_message = f"{text_message} {scene_message}"
+        print(full_message)
+
+        
+        last_spoken_text = full_message
+        speak_text(full_message, speed_multiplier=1.5)
+
+def handle_button2():
+    """Handle Button 2 press with timing-based functionality."""
+    press_start_time = current_time()
+
+    # Wait until the button is released
+    while GPIO.input(BUTTON2_PIN) == GPIO.LOW:
+        sleep(0.1)
+
+    press_duration = current_time() - press_start_time
+    print(f"Button 2 pressed for {press_duration:.2f} seconds.")
+
+    # Short press (< 0.5 seconds): Repeat last spoken text at 1.5x speed
+    if press_duration < 0.5:
+        print("Short press detected: Repeating at 1.5x speed.")
+        speak_text("Repeating at regular speed.")
+        speak_text(last_spoken_text, speed_multiplier=1.5)
+
+    # Long press (≥ 0.5 seconds): Repeat last spoken text at 0.75x speed
+    else:
+        print("Long press detected: Repeating at 0.75x speed.")
+        speak_text("Repeating at slower speed.")
+        speak_text(last_spoken_text, speed_multiplier=0.75)
+
+def main():
+    configure_camera()
+    start_camera()
+    print("Waiting for button presses...")
+
+    try:
+        while True:
+            # Check if Button 1 is pressed
+            if GPIO.input(BUTTON1_PIN) == GPIO.LOW:
+                handle_button1()
+
+            # Check if Button 2 is pressed
+            if GPIO.input(BUTTON2_PIN) == GPIO.LOW:
+                handle_button2()
+
+            sleep(0.1)
+    except KeyboardInterrupt:
+        print("\nExiting program")
+    finally:
+        stop_camera()
+        GPIO.cleanup()
+
+if __name__ == "__main__":
+    main()
+
+
+
+
